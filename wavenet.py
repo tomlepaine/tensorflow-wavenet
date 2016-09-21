@@ -1,5 +1,5 @@
 import tensorflow as tf
-from wavenet_ops import causal_conv
+from wavenet_ops import causal_conv, Queue
 
 class WaveNet(object):
     '''Implements the WaveNet network for generative audio.
@@ -18,18 +18,19 @@ class WaveNet(object):
                  dilations,
                  filter_width,
                  residual_channels,
-                 dilation_channels):
+                 dilation_channels,
+                 fast_generation=False):
         self.batch_size = batch_size
         self.channels = channels
         self.dilations = dilations
         self.filter_width = filter_width
         self.residual_channels = residual_channels
         self.dilation_channels = dilation_channels
-
+        self.fast_generation = fast_generation
 
     # A single causal convolution layer that can change the number of channels.
     def _create_causal_layer(self, input_batch, in_channels, out_channels):
-        with tf.name_scope('causal_layer'):
+        with tf.variable_scope('causal_layer'):
             weights_filter = tf.Variable(tf.truncated_normal(
                 [self.filter_width, in_channels, out_channels],
                 stddev=0.2,
@@ -55,6 +56,7 @@ class WaveNet(object):
 
         weights_dense = tf.Variable(tf.truncated_normal(
             [1, dilation_channels, in_channels], stddev=0.2, name="dense"))
+
         transformed = tf.nn.conv1d(out, weights_dense, stride=1,
                                    padding="SAME", name="dense")
         layer = 'layer{}'.format(layer_index)
@@ -63,11 +65,53 @@ class WaveNet(object):
         tf.histogram_summary(layer + '_dense', weights_dense)
 
         return transformed, input_batch + transformed
+    
+
+    def _apply_weights(self, input_batch, state_batch, weights):
+        weights_recurrent = weights[0, :, :]
+        weights_embedding = weights[1, :, :]
+
+        output = tf.matmul(input_batch, weights_embedding) + tf.matmul(state_batch, weights_recurrent)
+        return output
+
+
+    def _generator_causal_layer(self, input_batch, state_batch, in_channels, out_channels):
+        with tf.variable_scope('causal_layer'):
+            weights_filter = tf.Variable(tf.truncated_normal(
+                [self.filter_width, in_channels, out_channels],
+                stddev=0.2,
+                name="filter"))
+
+            output = self._apply_weights(input_batch, state_batch, weights_filter)
+            print 'causal dtype:', output.dtype
+        return output
+
+
+    def _generator_dilation_layer(self, input_batch, state_batch, layer_index, dilation, in_channels, dilation_channels):
+        weights_filter = tf.Variable(tf.truncated_normal(
+            [self.filter_width, in_channels, dilation_channels],
+            stddev=0.2,
+            name="filter"))
+        weights_gate = tf.Variable(tf.truncated_normal(
+            [self.filter_width, in_channels, dilation_channels],
+            stddev=0.2, name="gate"))
+
+        output_filter = self._apply_weights(input_batch, state_batch, weights_filter)
+        output_gate = self._apply_weights(input_batch, state_batch, weights_gate)
+
+        out = tf.tanh(output_filter) * tf.sigmoid(output_gate)
+
+        weights_dense = tf.Variable(tf.truncated_normal(
+            [1, dilation_channels, in_channels], stddev=0.2, name="dense"))
+        transformed = tf.matmul(out, weights_dense[0, :, :])
+        layer = 'layer{}'.format(layer_index)
+
+        return transformed, input_batch + transformed
 
 
     def _preprocess(self, audio):
         '''Quantizes waveform amplitudes.'''
-        with tf.name_scope('preprocessing'):
+        with tf.variable_scope('preprocessing'):
             mu = self.channels - 1
             # Perform mu-law companding transformation (ITU-T, 1988).
             magnitude = tf.log(1 + mu * tf.abs(audio)) / tf.log(1. + mu)
@@ -89,14 +133,16 @@ class WaveNet(object):
 
     def _create_network(self, input_batch):
         outputs = []
+        current_layers = []
         current_layer = input_batch
 
         current_layer = self._create_causal_layer(current_layer, self.channels, self.residual_channels)
-
+        current_layers.append(current_layer)
+        
         # Add all defined dilation layers.
-        with tf.name_scope('dilated_stack'):
+        with tf.variable_scope('dilated_stack'):
             for layer_index, dilation in enumerate(self.dilations):
-                with tf.name_scope('layer{}'.format(layer_index)):
+                with tf.variable_scope('layer{}'.format(layer_index)):
                     output, current_layer = self._create_dilation_layer(
                         current_layer,
                         layer_index,
@@ -104,10 +150,15 @@ class WaveNet(object):
                         self.residual_channels,
                         self.dilation_channels)
                     outputs.append(output)
+                    current_layers.append(current_layer)
+                    
+        self.outputs = outputs
+        self.current_layers = current_layers
 
-        with tf.name_scope('postprocessing'):
+        with tf.variable_scope('postprocessing'):
             # Perform (+) -> ReLU -> 1x1 conv -> ReLU -> 1x1 conv to
             # postprocess the output.
+
             w1 = tf.Variable(tf.truncated_normal(
                 [1, self.residual_channels, int(self.channels / 2)], stddev=0.3,
                 name="postprocess1"))
@@ -127,16 +178,88 @@ class WaveNet(object):
             conv2 = tf.nn.conv1d(transformed2, w2, stride=1, padding="SAME")
 
         return conv2
+    
+    def _create_generator(self, input_batch):
+        outputs = []
+        current_layers = []
+        push_ops = []
+        current_layer = input_batch
+        print 'input layer', current_layer.get_shape()
+
+        q = Queue(batch_size=self.batch_size,
+                  state_size=self.channels,
+                  buffer_size=1)
+
+        current_state = q.pop()
+        print 'input state', current_state.get_shape()
+        push = q.push(current_layer)
+        push_ops.append(push)
+
+        current_layer = self._generator_causal_layer(current_layer, current_state, self.channels, self.residual_channels)
+        print 'causal layer', current_layer.get_shape()
+        current_layers.append(current_layer)
+
+        # Add all defined dilation layers.
+        with tf.name_scope('dilated_stack'):
+            for layer_index, dilation in enumerate(self.dilations):
+                with tf.name_scope('layer{}'.format(layer_index)):
+
+                    q = Queue(batch_size=self.batch_size,
+                              state_size=self.residual_channels,
+                              buffer_size=dilation)
+
+                    current_state = q.pop()
+                    print 'layer{} state'.format(layer_index), current_state.get_shape()
+                    push = q.push(current_layer)
+                    push_ops.append(push)                
+
+                    output, current_layer = self._generator_dilation_layer(
+                        current_layer,
+                        current_state,
+                        layer_index,
+                        dilation,
+                        self.residual_channels,
+                        self.dilation_channels)
+
+                    outputs.append(output)
+                    current_layers.append(current_layer)
+        self.outputs = outputs
+        self.current_layers = current_layers
+
+        with tf.name_scope('postprocessing'):
+            # Perform (+) -> ReLU -> 1x1 conv -> ReLU -> 1x1 conv to
+            # postprocess the output.
+            w1 = tf.Variable(tf.truncated_normal(
+                [1, self.residual_channels, int(self.channels / 2)], stddev=0.3,
+                name="postprocess1"))
+            w2 = tf.Variable(tf.truncated_normal(
+                [1, int(self.channels / 2), self.channels], stddev=0.3,
+                name="postprocess2"))
+
+            # We skip connections from the outputs of each layer, adding them
+            # all up here.
+            total = sum(outputs)
+            transformed1 = tf.nn.relu(total)
+            conv1 = tf.matmul(transformed1, w1[0, :, :])
+            transformed2 = tf.nn.relu(conv1)
+            conv2 = tf.matmul(transformed2, w2[0, :, :])
+
+        return conv2, push_ops
 
 
     def _one_hot(self, input_batch):
         # One-hot encode waveform amplitudes, so we can define the network
         # as a categorical distribution over possible amplitudes.
-        with tf.name_scope('one_hot_encode'):
+        with tf.variable_scope('one_hot_encode'):
             encoded = tf.one_hot(input_batch, depth=self.channels,
                                  dtype=tf.float32)
+            if self.fast_generation:
+                shape = [self.batch_size, self.channels]
+            else:
+                shape = [self.batch_size, -1, self.channels]
+
             encoded = tf.reshape(encoded,
-                                 [self.batch_size, -1, self.channels])
+                                 shape)
 
         return encoded
 
@@ -144,11 +267,19 @@ class WaveNet(object):
     def predict_proba(self, waveform, name='wavenet'):
         with tf.variable_scope(name):
             encoded = self._one_hot(waveform)
-            raw_output = self._create_network(encoded)
+            if self.fast_generation:
+                raw_output, push_ops = self._create_generator(encoded)
+            else:
+                raw_output = self._create_network(encoded)
+                push_ops = [tf.no_op()]
+            print 'raw_output', raw_output.get_shape()
             out = tf.reshape(raw_output, [-1, self.channels])
+            print 'out', out.get_shape()
             proba = tf.nn.softmax(tf.cast(out, tf.float64))
+            print 'proba', proba.get_shape()
             last = tf.slice(proba, [tf.shape(proba)[0] - 1, 0], [1, self.channels])
-            return tf.reshape(last, [-1])
+            print 'last', last.get_shape()
+            return tf.reshape(last, [-1]), push_ops
 
 
     def loss(self, input_batch, name='wavenet'):
@@ -157,7 +288,7 @@ class WaveNet(object):
             encoded = self._one_hot(input_batch)
             raw_output = self._create_network(encoded)
 
-            with tf.name_scope('loss'):
+            with tf.variable_scope('loss'):
                 # Shift original input left by one sample, which means that
                 # each output sample has to predict the next input sample.
                 shifted = tf.slice(encoded, [0, 1, 0],

@@ -1,8 +1,12 @@
 
 import argparse
+from time import time
 from datetime import datetime
 import json
 import os
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 import numpy as np
 import tensorflow as tf
@@ -11,7 +15,7 @@ from wavenet import WaveNet
 
 SAMPLES = 16000
 LOGDIR = './logdir'
-WINDOW = 8000
+WINDOW = 80000
 WAVENET_PARAMS = './wavenet_params.json'
 
 def get_arguments():
@@ -30,6 +34,8 @@ def get_arguments():
                         help='JSON file with the network parameters')
     parser.add_argument('--wav_out_path', type=str, default=None,
                         help='Path to output wav file')
+    parser.add_argument('--fast_generation', type=bool, default=False,
+                        help='Use fast generation')
     return parser.parse_args()
 
 def main():
@@ -46,30 +52,57 @@ def main():
         wavenet_params['dilations'],
         wavenet_params['filter_width'],
         wavenet_params['residual_channels'],
-        wavenet_params['dilation_channels'])
+        wavenet_params['dilation_channels'],
+        fast_generation=args.fast_generation)
 
     samples = tf.placeholder(tf.int32)
 
-    next_sample = net.predict_proba(samples)
+    next_sample, push_ops = net.predict_proba(samples)
+    
+    sess.run(tf.initialize_all_variables())
 
-    saver = tf.train.Saver()
+    variables_to_restore = {var.name[:-2]: var for var in tf.all_variables() if 'Variable' in var.name}
+    saver = tf.train.Saver(variables_to_restore)
     print('Restoring model from {}'.format(args.checkpoint))
     saver.restore(sess, args.checkpoint)
 
     quantization_steps = wavenet_params['quantization_steps']
-    waveform = np.random.randint(quantization_steps, size=(1,)).tolist()
+    # waveform = np.random.randint(quantization_steps, size=(1,)).tolist()
+    waveform = [0]
+    times = []
     for step in range(args.samples):
-        if len(waveform) > args.window:
-            window = waveform[-args.window:]
+        if args.fast_generation:
+            window = waveform[-1]
+            outputs = [next_sample]
+            outputs.extend(push_ops)
+            tic = time()
+            outputs_list = sess.run(
+                outputs,
+                feed_dict={samples: window})
+            prediction = outputs_list[0]
+            toc = time()
         else:
-            window = waveform
-        prediction = sess.run(
-            next_sample,
-            feed_dict={samples: window})
-        sample = np.random.choice(np.arange(quantization_steps), p=prediction)
+            if len(waveform) > args.window:
+                window = waveform[-args.window:]
+            else:
+                window = waveform
+            outputs = [next_sample]
+            tic = time()
+            prediction = sess.run(
+                next_sample,
+                feed_dict={samples: window})
+            toc = time()
+
+        times.append(toc-tic)
+        print 'Average sample took {} seconds.'.format(np.mean(times))
+        sample = np.argmax(prediction)
+        # sample = np.random.choice(np.arange(quantization_steps), p=prediction)
         waveform.append(sample)
         print('Sample {:3<d}/{:3<d}: {}'.format(step + 1, args.samples, sample))
-
+    plt.plot(waveform)
+    plt.xlabel('sample #')
+    plt.ylabel('time')
+    plt.savefig('time_per_sample.png')
     # Undo the companding transformation
     result = net.decode(samples)
 
